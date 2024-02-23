@@ -469,6 +469,7 @@ func GetRedisNodesByRole(cr *redisv1beta2.RedisReplication, redisRole string) []
 	statefulset, err := GetStatefulSet(cr.Namespace, cr.Name)
 	if err != nil {
 		logger.Error(err, "Failed to Get the Statefulset of the", "custom resource", cr.Name, "in namespace", cr.Namespace)
+		return nil
 	}
 
 	var pods []string
