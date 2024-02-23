@@ -3,8 +3,6 @@ name: Release container images
 on:
   push:
     branches: [master]
-  pull_request:
-    branches: [master]
 
 env:
   ApplicationName: redis-operator
@@ -28,7 +26,8 @@ jobs:
         registry: docker.io
         username: ${{ secrets.DOCKERHUB_USERNAME }}
         password: ${{ secrets.DOCKERHUB_PASSWD }}
-
+    - name: buildx
+      run: docker buildx create --use
   build_multi_arch:
     needs: setup
     runs-on: ubuntu-latest
