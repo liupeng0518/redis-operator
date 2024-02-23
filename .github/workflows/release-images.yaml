@@ -40,4 +40,4 @@ jobs:
         file: ${{ env.DOCKERFILE_PATH }}
         platforms: linux/amd64,linux/arm64
         push: true
-        tags: ${{ env.QuayImageName }}:{{ env.AppVersion }}, ${{ env.QuayImageName }}:latest
+        tags: ${{ env.QuayImageName }}:${{ env.AppVersion }}, ${{ env.QuayImageName }}:latest
