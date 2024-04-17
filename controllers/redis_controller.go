@@ -25,6 +25,8 @@ import (
 	"github.com/go-logr/logr"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/kubernetes"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
@@ -32,8 +34,10 @@ import (
 // RedisReconciler reconciles a Redis object
 type RedisReconciler struct {
 	client.Client
-	Log    logr.Logger
-	Scheme *runtime.Scheme
+	K8sClient  kubernetes.Interface
+	Dk8sClient dynamic.Interface
+	Log        logr.Logger
+	Scheme     *runtime.Scheme
 }
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims
@@ -53,19 +57,19 @@ func (r *RedisReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 		reqLogger.Info("Found annotations redis.opstreelabs.in/skip-reconcile, so skipping reconcile")
 		return ctrl.Result{RequeueAfter: time.Second * 10}, nil
 	}
-	if err := k8sutils.HandleRedisFinalizer(instance, r.Client); err != nil {
+	if err = k8sutils.HandleRedisFinalizer(r.Client, r.K8sClient, r.Log, instance); err != nil {
 		return ctrl.Result{}, err
 	}
 
-	if err := k8sutils.AddRedisFinalizer(instance, r.Client); err != nil {
+	if err = k8sutils.AddRedisFinalizer(instance, r.Client); err != nil {
 		return ctrl.Result{}, err
 	}
 
-	err = k8sutils.CreateStandaloneRedis(instance)
+	err = k8sutils.CreateStandaloneRedis(instance, r.K8sClient)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	err = k8sutils.CreateStandaloneService(instance)
+	err = k8sutils.CreateStandaloneService(instance, r.K8sClient)
 	if err != nil {
 		return ctrl.Result{}, err
 	}

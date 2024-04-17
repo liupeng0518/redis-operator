@@ -20,22 +20,20 @@ import (
 	"flag"
 	"os"
 
-	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
-	// to ensure that exec-entrypoint and run can make use of them.
-	_ "k8s.io/client-go/plugin/pkg/client/auth"
-
+	redisv1beta1 "github.com/OT-CONTAINER-KIT/redis-operator/api/v1beta1"
+	redisv1beta2 "github.com/OT-CONTAINER-KIT/redis-operator/api/v1beta2"
+	"github.com/OT-CONTAINER-KIT/redis-operator/controllers"
+	"github.com/OT-CONTAINER-KIT/redis-operator/k8sutils"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	_ "k8s.io/client-go/plugin/pkg/client/auth"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
-
-	redisv1beta2 "github.com/OT-CONTAINER-KIT/redis-operator/api/v1beta2"
-	"github.com/OT-CONTAINER-KIT/redis-operator/controllers"
-
-	redisv1beta1 "github.com/OT-CONTAINER-KIT/redis-operator/api/v1beta1"
-	// +kubebuilder:scaffold:imports
+	"sigs.k8s.io/controller-runtime/pkg/metrics/server"
+	"sigs.k8s.io/controller-runtime/pkg/webhook"
 )
 
 var (
@@ -43,6 +41,7 @@ var (
 	setupLog = ctrl.Log.WithName("setup")
 )
 
+//nolint:gochecknoinits
 func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
 
@@ -73,16 +72,22 @@ func main() {
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
 
 	options := ctrl.Options{
-		Scheme:                 scheme,
-		MetricsBindAddress:     metricsAddr,
-		Port:                   9443,
+		Scheme: scheme,
+		Metrics: server.Options{
+			BindAddress: metricsAddr,
+		},
+		WebhookServer: &webhook.DefaultServer{
+			Options: webhook.Options{
+				Port: 9443,
+			},
+		},
 		HealthProbeBindAddress: probeAddr,
 		LeaderElection:         enableLeaderElection,
 		LeaderElectionID:       "6cab913b.redis.opstreelabs.in",
 	}
 
 	if ns := os.Getenv("WATCH_NAMESPACE"); ns != "" {
-		options.Namespace = ns
+		options.Cache.DefaultNamespaces = map[string]cache.Config{ns: {}}
 	}
 
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), options)
@@ -91,35 +96,54 @@ func main() {
 		os.Exit(1)
 	}
 
+	k8sclient, err := k8sutils.GenerateK8sClient(k8sutils.GenerateK8sConfig())
+	if err != nil {
+		setupLog.Error(err, "unable to create k8s client")
+		os.Exit(1)
+	}
+
+	dk8sClient, err := k8sutils.GenerateK8sDynamicClient(k8sutils.GenerateK8sConfig())
+	if err != nil {
+		setupLog.Error(err, "unable to create k8s dynamic client")
+		os.Exit(1)
+	}
+
 	if err = (&controllers.RedisReconciler{
-		Client: mgr.GetClient(),
-		Log:    ctrl.Log.WithName("controllers").WithName("Redis"),
-		Scheme: mgr.GetScheme(),
+		Client:     mgr.GetClient(),
+		K8sClient:  k8sclient,
+		Dk8sClient: dk8sClient,
+		Log:        ctrl.Log.WithName("controllers").WithName("Redis"),
+		Scheme:     mgr.GetScheme(),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "Redis")
 		os.Exit(1)
 	}
 	if err = (&controllers.RedisClusterReconciler{
-		Client: mgr.GetClient(),
-		Log:    ctrl.Log.WithName("controllers").WithName("RedisCluster"),
-		Scheme: mgr.GetScheme(),
+		Client:     mgr.GetClient(),
+		K8sClient:  k8sclient,
+		Dk8sClient: dk8sClient,
+		Log:        ctrl.Log.WithName("controllers").WithName("RedisCluster"),
+		Scheme:     mgr.GetScheme(),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "RedisCluster")
 		os.Exit(1)
 	}
 	if err = (&controllers.RedisReplicationReconciler{
-		Client: mgr.GetClient(),
-		Log:    ctrl.Log.WithName("controllers").WithName("RedisReplication"),
-		Scheme: mgr.GetScheme(),
+		Client:     mgr.GetClient(),
+		K8sClient:  k8sclient,
+		Dk8sClient: dk8sClient,
+		Log:        ctrl.Log.WithName("controllers").WithName("RedisReplication"),
+		Scheme:     mgr.GetScheme(),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "RedisReplication")
 		os.Exit(1)
 	}
-
 	if err = (&controllers.RedisSentinelReconciler{
-		Client: mgr.GetClient(),
-		Log:    ctrl.Log.WithName("controllers").WithName("RedisSentinel"),
-		Scheme: mgr.GetScheme(),
+		Client:     mgr.GetClient(),
+		K8sClient:  k8sclient,
+		Dk8sClient: dk8sClient,
+		Log:        ctrl.Log.WithName("controllers").WithName("RedisSentinel"),
+		Scheme:     mgr.GetScheme(),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "RedisSentinel")
 		os.Exit(1)

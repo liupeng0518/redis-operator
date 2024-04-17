@@ -1,18 +1,24 @@
 package k8sutils
 
 import (
+	"context"
+	"fmt"
 	"strconv"
 	"strings"
 
 	redisv1beta2 "github.com/OT-CONTAINER-KIT/redis-operator/api/v1beta2"
-	"github.com/go-redis/redis"
+	"github.com/go-logr/logr"
+	redis "github.com/redis/go-redis/v9"
+	"k8s.io/client-go/kubernetes"
 )
 
-// Reshard the redis Cluster
-func ReshardRedisCluster(cr *redisv1beta2.RedisCluster) {
-	logger := generateRedisManagerLogger(cr.Namespace, cr.ObjectMeta.Name)
+// ReshardRedisCluster transfer the slots from the last node to the first node.
+//
+// NOTE: when all slot been transferred, the node become slave of the first master node.
+func ReshardRedisCluster(client kubernetes.Interface, logger logr.Logger, cr *redisv1beta2.RedisCluster, remove bool) {
+	ctx := context.TODO()
 	var cmd []string
-	currentRedisCount := CheckRedisNodeCount(cr, "leader")
+	currentRedisCount := CheckRedisNodeCount(ctx, client, logger, cr, "leader")
 
 	// Transfer Pod details
 	transferPOD := RedisDetails{
@@ -27,13 +33,13 @@ func ReshardRedisCluster(cr *redisv1beta2.RedisCluster) {
 	cmd = []string{"redis-cli", "--cluster", "reshard"}
 
 	if *cr.Spec.ClusterVersion == "v7" {
-		cmd = append(cmd, getRedisHostname(transferPOD, cr, "leader")+":6379")
+		cmd = append(cmd, getRedisHostname(transferPOD, cr, "leader")+fmt.Sprintf(":%d", *cr.Spec.Port))
 	} else {
-		cmd = append(cmd, getRedisServerIP(transferPOD)+":6379")
+		cmd = append(cmd, getRedisServerAddress(client, logger, transferPOD, *cr.Spec.Port))
 	}
 
 	if cr.Spec.KubernetesConfig.ExistingPasswordSecret != nil {
-		pass, err := getRedisPassword(cr.Namespace, *cr.Spec.KubernetesConfig.ExistingPasswordSecret.Name, *cr.Spec.KubernetesConfig.ExistingPasswordSecret.Key)
+		pass, err := getRedisPassword(client, logger, cr.Namespace, *cr.Spec.KubernetesConfig.ExistingPasswordSecret.Name, *cr.Spec.KubernetesConfig.ExistingPasswordSecret.Key)
 		if err != nil {
 			logger.Error(err, "Error in getting redis password")
 		}
@@ -46,17 +52,17 @@ func ReshardRedisCluster(cr *redisv1beta2.RedisCluster) {
 	//--cluster-from <node-id> --cluster-to <node-id> --cluster-slots <number of slots> --cluster-yes
 
 	// Remove Node
-	removeNodeID := getRedisNodeID(cr, removePOD)
+	removeNodeID := getRedisNodeID(ctx, client, logger, cr, removePOD)
 	cmd = append(cmd, "--cluster-from")
 	cmd = append(cmd, removeNodeID)
 
 	// Transfer Node
-	transferNodeID := getRedisNodeID(cr, transferPOD)
+	transferNodeID := getRedisNodeID(ctx, client, logger, cr, transferPOD)
 	cmd = append(cmd, "--cluster-to")
 	cmd = append(cmd, transferNodeID)
 
 	// Cluster Slots
-	slot := getRedisClusterSlots(cr, removeNodeID)
+	slot := getRedisClusterSlots(ctx, client, logger, cr, removeNodeID)
 	cmd = append(cmd, "--cluster-slots")
 	cmd = append(cmd, slot)
 
@@ -68,64 +74,51 @@ func ReshardRedisCluster(cr *redisv1beta2.RedisCluster) {
 		logger.V(1).Info("Skipped the execution of", "Cmd", cmd)
 		return
 	}
-	executeCommand(cr, cmd, cr.ObjectMeta.Name+"-leader-0")
+	executeCommand(client, logger, cr, cmd, cr.ObjectMeta.Name+"-leader-0")
+
+	if remove {
+		RemoveRedisNodeFromCluster(ctx, client, logger, cr, removePOD)
+	}
 }
 
-func getRedisClusterSlots(cr *redisv1beta2.RedisCluster, nodeID string) string {
-	logger := generateRedisManagerLogger(cr.Namespace, cr.ObjectMeta.Name)
+func getRedisClusterSlots(ctx context.Context, client kubernetes.Interface, logger logr.Logger, cr *redisv1beta2.RedisCluster, nodeID string) string {
 	totalSlots := 0
 
-	redisClient := configureRedisClient(cr, cr.ObjectMeta.Name+"-leader-0")
+	redisClient := configureRedisClient(client, logger, cr, cr.ObjectMeta.Name+"-leader-0")
 	defer redisClient.Close()
-	redisClusterInfo, err := redisClient.ClusterNodes().Result()
+
+	redisSlots, err := redisClient.ClusterSlots(ctx).Result()
 	if err != nil {
-		logger.Error(err, "Failed to Get Cluster Info")
+		logger.Error(err, "Failed to Get Cluster Slots")
 		return ""
 	}
-
-	// Split the Redis cluster info into lines
-	lines := strings.Split(redisClusterInfo, "\n")
-
-	// Iterate through all lines
-	for _, line := range lines {
-		if strings.Contains(line, "master") && strings.Contains(line, "connected") { // Check if this line is a master node
-			parts := strings.Fields(line)
-			if parts[0] == nodeID { // Check if this is the node we're interested in
-				for _, conn := range parts[8:] {
-					slotRange := strings.Split(conn, "-")
-					if len(slotRange) < 2 {
-						totalSlots = totalSlots + 1
-					} else {
-						start, _ := strconv.Atoi(slotRange[0])
-						end, _ := strconv.Atoi(slotRange[1])
-						totalSlots = totalSlots + end - start + 1
-					}
-				}
+	for _, slot := range redisSlots {
+		for _, node := range slot.Nodes {
+			if node.ID == nodeID {
+				// Each slot range is a continuous block managed by the node
+				totalSlots += slot.End - slot.Start + 1
 				break
 			}
 		}
 	}
 
-	logger.V(1).Info("Total cluster slots to be transfered from", "node", nodeID, "is", totalSlots)
-
+	logger.V(1).Info("Total cluster slots to be transferred from", "node", nodeID, "is", totalSlots)
 	return strconv.Itoa(totalSlots)
 }
 
 // getRedisNodeID would return nodeID of a redis node by passing pod
-func getRedisNodeID(cr *redisv1beta2.RedisCluster, pod RedisDetails) string {
-	var client *redis.Client
-	logger := generateRedisManagerLogger(cr.Namespace, cr.ObjectMeta.Name)
-	client = configureRedisClient(cr, pod.PodName)
-	defer client.Close()
+func getRedisNodeID(ctx context.Context, client kubernetes.Interface, logger logr.Logger, cr *redisv1beta2.RedisCluster, pod RedisDetails) string {
+	redisClient := configureRedisClient(client, logger, cr, pod.PodName)
+	defer redisClient.Close()
 
-	pong, err := client.Ping().Result()
+	pong, err := redisClient.Ping(ctx).Result()
 	if err != nil || pong != "PONG" {
 		logger.Error(err, "Failed to ping Redis server")
 		return ""
 	}
 
-	cmd := redis.NewStringCmd("cluster", "myid")
-	err = client.Process(cmd)
+	cmd := redis.NewStringCmd(ctx, "cluster", "myid")
+	err = redisClient.Process(ctx, cmd)
 	if err != nil {
 		logger.Error(err, "Redis command failed with this error")
 		return ""
@@ -141,8 +134,7 @@ func getRedisNodeID(cr *redisv1beta2.RedisCluster, pod RedisDetails) string {
 }
 
 // Rebalance the Redis CLuster using the Empty Master Nodes
-func RebalanceRedisClusterEmptyMasters(cr *redisv1beta2.RedisCluster) {
-	logger := generateRedisManagerLogger(cr.Namespace, cr.ObjectMeta.Name)
+func RebalanceRedisClusterEmptyMasters(client kubernetes.Interface, logger logr.Logger, cr *redisv1beta2.RedisCluster) {
 	// cmd = redis-cli --cluster rebalance <redis>:<port> --cluster-use-empty-masters -a <pass>
 	var cmd []string
 	pod := RedisDetails{
@@ -152,15 +144,15 @@ func RebalanceRedisClusterEmptyMasters(cr *redisv1beta2.RedisCluster) {
 	cmd = []string{"redis-cli", "--cluster", "rebalance"}
 
 	if *cr.Spec.ClusterVersion == "v7" {
-		cmd = append(cmd, getRedisHostname(pod, cr, "leader")+":6379")
+		cmd = append(cmd, getRedisHostname(pod, cr, "leader")+fmt.Sprintf(":%d", *cr.Spec.Port))
 	} else {
-		cmd = append(cmd, getRedisServerIP(pod)+":6379")
+		cmd = append(cmd, getRedisServerAddress(client, logger, pod, *cr.Spec.Port))
 	}
 
 	cmd = append(cmd, "--cluster-use-empty-masters")
 
 	if cr.Spec.KubernetesConfig.ExistingPasswordSecret != nil {
-		pass, err := getRedisPassword(cr.Namespace, *cr.Spec.KubernetesConfig.ExistingPasswordSecret.Name, *cr.Spec.KubernetesConfig.ExistingPasswordSecret.Key)
+		pass, err := getRedisPassword(client, logger, cr.Namespace, *cr.Spec.KubernetesConfig.ExistingPasswordSecret.Name, *cr.Spec.KubernetesConfig.ExistingPasswordSecret.Key)
 		if err != nil {
 			logger.Error(err, "Error in getting redis password")
 		}
@@ -171,32 +163,30 @@ func RebalanceRedisClusterEmptyMasters(cr *redisv1beta2.RedisCluster) {
 	cmd = append(cmd, getRedisTLSArgs(cr.Spec.TLS, cr.ObjectMeta.Name+"-leader-0")...)
 
 	logger.V(1).Info("Redis cluster rebalance command is", "Command", cmd)
-	executeCommand(cr, cmd, cr.ObjectMeta.Name+"-leader-1")
+	executeCommand(client, logger, cr, cmd, cr.ObjectMeta.Name+"-leader-1")
 }
 
-func CheckIfEmptyMasters(cr *redisv1beta2.RedisCluster) {
-	logger := generateRedisManagerLogger(cr.Namespace, cr.ObjectMeta.Name)
-	totalRedisLeaderNodes := CheckRedisNodeCount(cr, "leader")
+func CheckIfEmptyMasters(ctx context.Context, client kubernetes.Interface, logger logr.Logger, cr *redisv1beta2.RedisCluster) {
+	totalRedisLeaderNodes := CheckRedisNodeCount(ctx, client, logger, cr, "leader")
 
 	for i := 0; i < int(totalRedisLeaderNodes); i++ {
 		pod := RedisDetails{
 			PodName:   cr.ObjectMeta.Name + "-leader-" + strconv.Itoa(i),
 			Namespace: cr.Namespace,
 		}
-		podNodeID := getRedisNodeID(cr, pod)
-		podSlots := getRedisClusterSlots(cr, podNodeID)
+		podNodeID := getRedisNodeID(ctx, client, logger, cr, pod)
+		podSlots := getRedisClusterSlots(ctx, client, logger, cr, podNodeID)
 
 		if podSlots == "0" || podSlots == "" {
 			logger.V(1).Info("Found Empty Redis Leader Node", "pod", pod)
-			RebalanceRedisClusterEmptyMasters(cr)
+			RebalanceRedisClusterEmptyMasters(client, logger, cr)
 			break
 		}
 	}
 }
 
 // Rebalance Redis Cluster Would Rebalance the Redis Cluster without using the empty masters
-func RebalanceRedisCluster(cr *redisv1beta2.RedisCluster) {
-	logger := generateRedisManagerLogger(cr.Namespace, cr.ObjectMeta.Name)
+func RebalanceRedisCluster(client kubernetes.Interface, logger logr.Logger, cr *redisv1beta2.RedisCluster) {
 	// cmd = redis-cli --cluster rebalance <redis>:<port> -a <pass>
 	var cmd []string
 	pod := RedisDetails{
@@ -206,13 +196,13 @@ func RebalanceRedisCluster(cr *redisv1beta2.RedisCluster) {
 	cmd = []string{"redis-cli", "--cluster", "rebalance"}
 
 	if *cr.Spec.ClusterVersion == "v7" {
-		cmd = append(cmd, getRedisHostname(pod, cr, "leader")+":6379")
+		cmd = append(cmd, getRedisHostname(pod, cr, "leader")+fmt.Sprintf(":%d", *cr.Spec.Port))
 	} else {
-		cmd = append(cmd, getRedisServerIP(pod)+":6379")
+		cmd = append(cmd, getRedisServerAddress(client, logger, pod, *cr.Spec.Port))
 	}
 
 	if cr.Spec.KubernetesConfig.ExistingPasswordSecret != nil {
-		pass, err := getRedisPassword(cr.Namespace, *cr.Spec.KubernetesConfig.ExistingPasswordSecret.Name, *cr.Spec.KubernetesConfig.ExistingPasswordSecret.Key)
+		pass, err := getRedisPassword(client, logger, cr.Namespace, *cr.Spec.KubernetesConfig.ExistingPasswordSecret.Name, *cr.Spec.KubernetesConfig.ExistingPasswordSecret.Key)
 		if err != nil {
 			logger.Error(err, "Error in getting redis password")
 		}
@@ -223,14 +213,13 @@ func RebalanceRedisCluster(cr *redisv1beta2.RedisCluster) {
 	cmd = append(cmd, getRedisTLSArgs(cr.Spec.TLS, cr.ObjectMeta.Name+"-leader-0")...)
 
 	logger.V(1).Info("Redis cluster rebalance command is", "Command", cmd)
-	executeCommand(cr, cmd, cr.ObjectMeta.Name+"-leader-1")
+	executeCommand(client, logger, cr, cmd, cr.ObjectMeta.Name+"-leader-1")
 }
 
 // Add redis cluster node would add a node to the existing redis cluster using redis-cli
-func AddRedisNodeToCluster(cr *redisv1beta2.RedisCluster) {
-	logger := generateRedisManagerLogger(cr.Namespace, cr.ObjectMeta.Name)
+func AddRedisNodeToCluster(ctx context.Context, client kubernetes.Interface, logger logr.Logger, cr *redisv1beta2.RedisCluster) {
 	var cmd []string
-	activeRedisNode := CheckRedisNodeCount(cr, "leader")
+	activeRedisNode := CheckRedisNodeCount(ctx, client, logger, cr, "leader")
 
 	newPod := RedisDetails{
 		PodName:   cr.ObjectMeta.Name + "-leader-" + strconv.Itoa(int(activeRedisNode)),
@@ -244,15 +233,15 @@ func AddRedisNodeToCluster(cr *redisv1beta2.RedisCluster) {
 	cmd = []string{"redis-cli", "--cluster", "add-node"}
 
 	if *cr.Spec.ClusterVersion == "v7" {
-		cmd = append(cmd, getRedisHostname(newPod, cr, "leader")+":6379")
-		cmd = append(cmd, getRedisHostname(existingPod, cr, "leader")+":6379")
+		cmd = append(cmd, getRedisHostname(newPod, cr, "leader")+fmt.Sprintf(":%d", *cr.Spec.Port))
+		cmd = append(cmd, getRedisHostname(existingPod, cr, "leader")+fmt.Sprintf(":%d", *cr.Spec.Port))
 	} else {
-		cmd = append(cmd, getRedisServerIP(newPod)+":6379")
-		cmd = append(cmd, getRedisServerIP(existingPod)+":6379")
+		cmd = append(cmd, getRedisServerAddress(client, logger, newPod, *cr.Spec.Port))
+		cmd = append(cmd, getRedisServerAddress(client, logger, existingPod, *cr.Spec.Port))
 	}
 
 	if cr.Spec.KubernetesConfig.ExistingPasswordSecret != nil {
-		pass, err := getRedisPassword(cr.Namespace, *cr.Spec.KubernetesConfig.ExistingPasswordSecret.Name, *cr.Spec.KubernetesConfig.ExistingPasswordSecret.Key)
+		pass, err := getRedisPassword(client, logger, cr.Namespace, *cr.Spec.KubernetesConfig.ExistingPasswordSecret.Name, *cr.Spec.KubernetesConfig.ExistingPasswordSecret.Key)
 		if err != nil {
 			logger.Error(err, "Error in getting redis password")
 		}
@@ -263,44 +252,27 @@ func AddRedisNodeToCluster(cr *redisv1beta2.RedisCluster) {
 	cmd = append(cmd, getRedisTLSArgs(cr.Spec.TLS, cr.ObjectMeta.Name+"-leader-0")...)
 
 	logger.V(1).Info("Redis cluster add-node command is", "Command", cmd)
-	executeCommand(cr, cmd, cr.ObjectMeta.Name+"-leader-0")
+	executeCommand(client, logger, cr, cmd, cr.ObjectMeta.Name+"-leader-0")
 }
 
 // getAttachedFollowerNodeIDs would return a slice of redis followers attached to a redis leader
-func getAttachedFollowerNodeIDs(cr *redisv1beta2.RedisCluster, masterNodeID string) []string {
-	logger := generateRedisManagerLogger(cr.Namespace, cr.ObjectMeta.Name)
-
-	redisClient := configureRedisClient(cr, cr.ObjectMeta.Name+"-leader-0")
+func getAttachedFollowerNodeIDs(ctx context.Context, client kubernetes.Interface, logger logr.Logger, cr *redisv1beta2.RedisCluster, masterNodeID string) []string {
+	redisClient := configureRedisClient(client, logger, cr, cr.ObjectMeta.Name+"-leader-0")
 	defer redisClient.Close()
-	redisClusterInfo, err := redisClient.ClusterNodes().Result()
+
+	slaveIDs, err := redisClient.ClusterSlaves(ctx, masterNodeID).Result()
 	if err != nil {
-		logger.Error(err, "Failed to Get Cluster Info")
+		logger.Error(err, "Failed to get attached follower node IDs", "masterNodeID", masterNodeID)
 		return nil
 	}
-
-	slaveIDs := []string{}
-	// Split the Redis cluster info into lines
-	lines := strings.Split(redisClusterInfo, "\n")
-
-	for _, line := range lines {
-		if strings.Contains(line, "slave") && strings.Contains(line, "connected") {
-			parts := strings.Fields(line)
-			if len(parts) >= 3 && parts[3] == masterNodeID {
-				slaveIDs = append(slaveIDs, parts[0])
-			}
-		}
-
-	}
-
 	logger.V(1).Info("Slaves Nodes attached to", "node", masterNodeID, "are", slaveIDs)
 	return slaveIDs
 }
 
 // Remove redis follower node would remove all follower nodes of last leader node using redis-cli
-func RemoveRedisFollowerNodesFromCluster(cr *redisv1beta2.RedisCluster) {
-	logger := generateRedisManagerLogger(cr.Namespace, cr.ObjectMeta.Name)
+func RemoveRedisFollowerNodesFromCluster(ctx context.Context, client kubernetes.Interface, logger logr.Logger, cr *redisv1beta2.RedisCluster) {
 	var cmd []string
-	currentRedisCount := CheckRedisNodeCount(cr, "leader")
+	currentRedisCount := CheckRedisNodeCount(ctx, client, logger, cr, "leader")
 
 	existingPod := RedisDetails{
 		PodName:   cr.ObjectMeta.Name + "-leader-0",
@@ -314,7 +286,7 @@ func RemoveRedisFollowerNodesFromCluster(cr *redisv1beta2.RedisCluster) {
 	cmd = []string{"redis-cli"}
 
 	if cr.Spec.KubernetesConfig.ExistingPasswordSecret != nil {
-		pass, err := getRedisPassword(cr.Namespace, *cr.Spec.KubernetesConfig.ExistingPasswordSecret.Name, *cr.Spec.KubernetesConfig.ExistingPasswordSecret.Key)
+		pass, err := getRedisPassword(client, logger, cr.Namespace, *cr.Spec.KubernetesConfig.ExistingPasswordSecret.Name, *cr.Spec.KubernetesConfig.ExistingPasswordSecret.Key)
 		if err != nil {
 			logger.Error(err, "Error in getting redis password")
 		}
@@ -323,53 +295,51 @@ func RemoveRedisFollowerNodesFromCluster(cr *redisv1beta2.RedisCluster) {
 	}
 	cmd = append(cmd, getRedisTLSArgs(cr.Spec.TLS, cr.ObjectMeta.Name+"-leader-0")...)
 
-	lastLeaderPodNodeID := getRedisNodeID(cr, lastLeaderPod)
-	followerNodeIDs := getAttachedFollowerNodeIDs(cr, lastLeaderPodNodeID)
+	lastLeaderPodNodeID := getRedisNodeID(ctx, client, logger, cr, lastLeaderPod)
+	followerNodeIDs := getAttachedFollowerNodeIDs(ctx, client, logger, cr, lastLeaderPodNodeID)
 
 	cmd = append(cmd, "--cluster", "del-node")
 	if *cr.Spec.ClusterVersion == "v7" {
-		cmd = append(cmd, getRedisHostname(existingPod, cr, "leader")+":6379")
+		cmd = append(cmd, getRedisHostname(existingPod, cr, "leader")+fmt.Sprintf(":%d", *cr.Spec.Port))
 	} else {
-		cmd = append(cmd, getRedisServerIP(existingPod)+":6379")
+		cmd = append(cmd, getRedisServerAddress(client, logger, existingPod, *cr.Spec.Port))
 	}
 
 	for _, followerNodeID := range followerNodeIDs {
-
 		cmd = append(cmd, followerNodeID)
 		logger.V(1).Info("Redis cluster follower remove command is", "Command", cmd)
-		executeCommand(cr, cmd, cr.ObjectMeta.Name+"-leader-0")
+		executeCommand(client, logger, cr, cmd, cr.ObjectMeta.Name+"-leader-0")
 		cmd = cmd[:len(cmd)-1]
 	}
 }
 
 // Remove redis cluster node would remove last node to the existing redis cluster using redis-cli
-func RemoveRedisNodeFromCluster(cr *redisv1beta2.RedisCluster) {
-	logger := generateRedisManagerLogger(cr.Namespace, cr.ObjectMeta.Name)
+func RemoveRedisNodeFromCluster(ctx context.Context, client kubernetes.Interface, logger logr.Logger, cr *redisv1beta2.RedisCluster, removePod RedisDetails) {
 	var cmd []string
-	currentRedisCount := CheckRedisNodeCount(cr, "leader")
+	// currentRedisCount := CheckRedisNodeCount(ctx, client, logger, cr, "leader")
 
 	existingPod := RedisDetails{
 		PodName:   cr.ObjectMeta.Name + "-leader-0",
 		Namespace: cr.Namespace,
 	}
-	removePod := RedisDetails{
-		PodName:   cr.ObjectMeta.Name + "-leader-" + strconv.Itoa(int(currentRedisCount)-1),
-		Namespace: cr.Namespace,
-	}
+	//removePod := RedisDetails{
+	//	PodName:   cr.ObjectMeta.Name + "-leader-" + strconv.Itoa(int(currentRedisCount)-1),
+	//	Namespace: cr.Namespace,
+	//}
 
 	cmd = []string{"redis-cli", "--cluster", "del-node"}
 
 	if *cr.Spec.ClusterVersion == "v7" {
-		cmd = append(cmd, getRedisHostname(existingPod, cr, "leader")+":6379")
+		cmd = append(cmd, getRedisHostname(existingPod, cr, "leader")+fmt.Sprintf(":%d", *cr.Spec.Port))
 	} else {
-		cmd = append(cmd, getRedisServerIP(existingPod)+":6379")
+		cmd = append(cmd, getRedisServerAddress(client, logger, existingPod, *cr.Spec.Port))
 	}
 
-	removePodNodeID := getRedisNodeID(cr, removePod)
+	removePodNodeID := getRedisNodeID(ctx, client, logger, cr, removePod)
 	cmd = append(cmd, removePodNodeID)
 
 	if cr.Spec.KubernetesConfig.ExistingPasswordSecret != nil {
-		pass, err := getRedisPassword(cr.Namespace, *cr.Spec.KubernetesConfig.ExistingPasswordSecret.Name, *cr.Spec.KubernetesConfig.ExistingPasswordSecret.Key)
+		pass, err := getRedisPassword(client, logger, cr.Namespace, *cr.Spec.KubernetesConfig.ExistingPasswordSecret.Name, *cr.Spec.KubernetesConfig.ExistingPasswordSecret.Key)
 		if err != nil {
 			logger.Error(err, "Error in getting redis password")
 		}
@@ -380,27 +350,30 @@ func RemoveRedisNodeFromCluster(cr *redisv1beta2.RedisCluster) {
 	cmd = append(cmd, getRedisTLSArgs(cr.Spec.TLS, cr.ObjectMeta.Name+"-leader-0")...)
 
 	logger.V(1).Info("Redis cluster leader remove command is", "Command", cmd)
-	if getRedisClusterSlots(cr, removePodNodeID) != "0" {
+	if getRedisClusterSlots(ctx, client, logger, cr, removePodNodeID) != "0" {
 		logger.V(1).Info("Skipping execution remove leader not empty", "cmd", cmd)
 	}
-	executeCommand(cr, cmd, cr.ObjectMeta.Name+"-leader-0")
+	executeCommand(client, logger, cr, cmd, cr.ObjectMeta.Name+"-leader-0")
 }
 
 // verifyLeaderPod return true if the pod is leader/master
-func VerifyLeaderPod(cr *redisv1beta2.RedisCluster) bool {
-	logger := generateRedisManagerLogger(cr.Namespace, cr.ObjectMeta.Name)
-	podName := cr.Name + "-leader-" + strconv.Itoa(int(CheckRedisNodeCount(cr, "leader"))-1)
+func VerifyLeaderPod(ctx context.Context, client kubernetes.Interface, logger logr.Logger, cr *redisv1beta2.RedisCluster) bool {
+	podName := cr.Name + "-leader-" + strconv.Itoa(int(CheckRedisNodeCount(ctx, client, logger, cr, "leader"))-1)
 
-	redisClient := configureRedisClient(cr, podName)
+	redisClient := configureRedisClient(client, logger, cr, podName)
 	defer redisClient.Close()
-	info, err := redisClient.Info("replication").Result()
+	return verifyLeaderPodInfo(ctx, redisClient, logger, podName)
+}
+
+func verifyLeaderPodInfo(ctx context.Context, redisClient *redis.Client, logger logr.Logger, podName string) bool {
+	info, err := redisClient.Info(ctx, "replication").Result()
 	if err != nil {
 		logger.Error(err, "Failed to Get the role Info of the", "redis pod", podName)
 		return false
 	}
 
 	lines := strings.Split(info, "\r\n")
-	role := ""
+	var role string
 	for _, line := range lines {
 		if strings.HasPrefix(line, "role:") {
 			role = strings.TrimPrefix(line, "role:")
@@ -410,11 +383,9 @@ func VerifyLeaderPod(cr *redisv1beta2.RedisCluster) bool {
 	return false
 }
 
-func ClusterFailover(cr *redisv1beta2.RedisCluster) {
-	logger := generateRedisManagerLogger(cr.Namespace, cr.ObjectMeta.Name)
-	slavePodName := cr.Name + "-leader-" + strconv.Itoa(int(CheckRedisNodeCount(cr, "leader"))-1)
+func ClusterFailover(ctx context.Context, client kubernetes.Interface, logger logr.Logger, cr *redisv1beta2.RedisCluster) {
+	slavePodName := cr.Name + "-leader-" + strconv.Itoa(int(CheckRedisNodeCount(ctx, client, logger, cr, "leader"))-1)
 	// cmd = redis-cli cluster failover  -a <pass>
-
 	var cmd []string
 	pod := RedisDetails{
 		PodName:   slavePodName,
@@ -424,13 +395,13 @@ func ClusterFailover(cr *redisv1beta2.RedisCluster) {
 	cmd = []string{"redis-cli", "cluster", "failover"}
 
 	if *cr.Spec.ClusterVersion == "v7" {
-		cmd = append(cmd, getRedisHostname(pod, cr, "leader")+":6379")
+		cmd = append(cmd, getRedisHostname(pod, cr, "leader")+fmt.Sprintf(":%d", *cr.Spec.Port))
 	} else {
-		cmd = append(cmd, getRedisServerIP(pod)+":6379")
+		cmd = append(cmd, getRedisServerAddress(client, logger, pod, *cr.Spec.Port))
 	}
 
 	if cr.Spec.KubernetesConfig.ExistingPasswordSecret != nil {
-		pass, err := getRedisPassword(cr.Namespace, *cr.Spec.KubernetesConfig.ExistingPasswordSecret.Name, *cr.Spec.KubernetesConfig.ExistingPasswordSecret.Key)
+		pass, err := getRedisPassword(client, logger, cr.Namespace, *cr.Spec.KubernetesConfig.ExistingPasswordSecret.Name, *cr.Spec.KubernetesConfig.ExistingPasswordSecret.Key)
 		if err != nil {
 			logger.Error(err, "Error in getting redis password")
 		}
@@ -441,5 +412,5 @@ func ClusterFailover(cr *redisv1beta2.RedisCluster) {
 	cmd = append(cmd, getRedisTLSArgs(cr.Spec.TLS, slavePodName)...)
 
 	logger.V(1).Info("Redis cluster failover command is", "Command", cmd)
-	executeCommand(cr, cmd, slavePodName)
+	executeCommand(client, logger, cr, cmd, slavePodName)
 }

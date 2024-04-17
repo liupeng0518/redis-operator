@@ -2,12 +2,14 @@ package k8sutils
 
 import (
 	"context"
-	"strconv"
+	"fmt"
 
 	redisv1beta2 "github.com/OT-CONTAINER-KIT/redis-operator/api/v1beta2"
 	"github.com/go-logr/logr"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/utils/env"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 )
@@ -19,23 +21,18 @@ const (
 	RedisSentinelFinalizer    string = "redisSentinelFinalizer"
 )
 
-// finalizeLogger will generate logging interface
-func finalizerLogger(namespace string, name string) logr.Logger {
-	reqLogger := log.WithValues("Request.Service.Namespace", namespace, "Request.Finalizer.Name", name)
-	return reqLogger
-}
-
 // HandleRedisFinalizer finalize resource if instance is marked to be deleted
-func HandleRedisFinalizer(cr *redisv1beta2.Redis, cl client.Client) error {
-	logger := finalizerLogger(cr.Namespace, RedisFinalizer)
+func HandleRedisFinalizer(ctrlclient client.Client, k8sClient kubernetes.Interface, logger logr.Logger, cr *redisv1beta2.Redis) error {
 	if cr.GetDeletionTimestamp() != nil {
 		if controllerutil.ContainsFinalizer(cr, RedisFinalizer) {
-			if err := finalizeRedisPVC(cr); err != nil {
-				return err
+			if !cr.Spec.Storage.KeepAfterDelete {
+				if err := finalizeRedisPVC(k8sClient, logger, cr); err != nil {
+					return err
+				}
 			}
 			controllerutil.RemoveFinalizer(cr, RedisFinalizer)
-			if err := cl.Update(context.TODO(), cr); err != nil {
-				logger.Error(err, "Could not remove finalizer "+RedisFinalizer)
+			if err := ctrlclient.Update(context.TODO(), cr); err != nil {
+				logger.Error(err, "Could not remove finalizer", "finalizer", RedisFinalizer)
 				return err
 			}
 		}
@@ -44,15 +41,16 @@ func HandleRedisFinalizer(cr *redisv1beta2.Redis, cl client.Client) error {
 }
 
 // HandleRedisClusterFinalizer finalize resource if instance is marked to be deleted
-func HandleRedisClusterFinalizer(cr *redisv1beta2.RedisCluster, cl client.Client) error {
-	logger := finalizerLogger(cr.Namespace, RedisClusterFinalizer)
+func HandleRedisClusterFinalizer(ctrlclient client.Client, k8sClient kubernetes.Interface, logger logr.Logger, cr *redisv1beta2.RedisCluster) error {
 	if cr.GetDeletionTimestamp() != nil {
 		if controllerutil.ContainsFinalizer(cr, RedisClusterFinalizer) {
-			if err := finalizeRedisClusterPVC(cr); err != nil {
-				return err
+			if !cr.Spec.Storage.KeepAfterDelete {
+				if err := finalizeRedisClusterPVC(k8sClient, logger, cr); err != nil {
+					return err
+				}
 			}
 			controllerutil.RemoveFinalizer(cr, RedisClusterFinalizer)
-			if err := cl.Update(context.TODO(), cr); err != nil {
+			if err := ctrlclient.Update(context.TODO(), cr); err != nil {
 				logger.Error(err, "Could not remove finalizer "+RedisClusterFinalizer)
 				return err
 			}
@@ -62,15 +60,16 @@ func HandleRedisClusterFinalizer(cr *redisv1beta2.RedisCluster, cl client.Client
 }
 
 // Handle RedisReplicationFinalizer finalize resource if instance is marked to be deleted
-func HandleRedisReplicationFinalizer(cr *redisv1beta2.RedisReplication, cl client.Client) error {
-	logger := finalizerLogger(cr.Namespace, RedisReplicationFinalizer)
+func HandleRedisReplicationFinalizer(ctrlclient client.Client, k8sClient kubernetes.Interface, logger logr.Logger, cr *redisv1beta2.RedisReplication) error {
 	if cr.GetDeletionTimestamp() != nil {
 		if controllerutil.ContainsFinalizer(cr, RedisReplicationFinalizer) {
-			if err := finalizeRedisReplicationPVC(cr); err != nil {
-				return err
+			if !cr.Spec.Storage.KeepAfterDelete {
+				if err := finalizeRedisReplicationPVC(k8sClient, logger, cr); err != nil {
+					return err
+				}
 			}
 			controllerutil.RemoveFinalizer(cr, RedisReplicationFinalizer)
-			if err := cl.Update(context.TODO(), cr); err != nil {
+			if err := ctrlclient.Update(context.TODO(), cr); err != nil {
 				logger.Error(err, "Could not remove finalizer "+RedisReplicationFinalizer)
 				return err
 			}
@@ -80,15 +79,14 @@ func HandleRedisReplicationFinalizer(cr *redisv1beta2.RedisReplication, cl clien
 }
 
 // HandleRedisSentinelFinalizer finalize resource if instance is marked to be deleted
-func HandleRedisSentinelFinalizer(cr *redisv1beta2.RedisSentinel, cl client.Client) error {
-	logger := finalizerLogger(cr.Namespace, RedisSentinelFinalizer)
+func HandleRedisSentinelFinalizer(ctrlclient client.Client, logger logr.Logger, cr *redisv1beta2.RedisSentinel) error {
 	if cr.GetDeletionTimestamp() != nil {
 		if controllerutil.ContainsFinalizer(cr, RedisSentinelFinalizer) {
 			if err := finalizeRedisSentinelPVC(cr); err != nil {
 				return err
 			}
 			controllerutil.RemoveFinalizer(cr, RedisSentinelFinalizer)
-			if err := cl.Update(context.TODO(), cr); err != nil {
+			if err := ctrlclient.Update(context.TODO(), cr); err != nil {
 				logger.Error(err, "Could not remove finalizer "+RedisSentinelFinalizer)
 				return err
 			}
@@ -134,24 +132,24 @@ func AddRedisSentinelFinalizer(cr *redisv1beta2.RedisSentinel, cl client.Client)
 }
 
 // finalizeRedisPVC delete PVC
-func finalizeRedisPVC(cr *redisv1beta2.Redis) error {
-	logger := finalizerLogger(cr.Namespace, RedisFinalizer)
-	PVCName := cr.Name + "-" + cr.Name + "-0"
-	err := generateK8sClient().CoreV1().PersistentVolumeClaims(cr.Namespace).Delete(context.TODO(), PVCName, metav1.DeleteOptions{})
+func finalizeRedisPVC(client kubernetes.Interface, logger logr.Logger, cr *redisv1beta2.Redis) error {
+	pvcTemplateName := env.GetString(EnvOperatorSTSPVCTemplateName, cr.Name)
+	PVCName := fmt.Sprintf("%s-%s-0", pvcTemplateName, cr.Name)
+	err := client.CoreV1().PersistentVolumeClaims(cr.Namespace).Delete(context.TODO(), PVCName, metav1.DeleteOptions{})
 	if err != nil && !errors.IsNotFound(err) {
-		logger.Error(err, "Could not delete Persistent Volume Claim "+PVCName)
+		logger.Error(err, "Could not delete Persistent Volume Claim", "PVCName", PVCName)
 		return err
 	}
 	return nil
 }
 
 // finalizeRedisClusterPVC delete PVCs
-func finalizeRedisClusterPVC(cr *redisv1beta2.RedisCluster) error {
-	logger := finalizerLogger(cr.Namespace, RedisClusterFinalizer)
+func finalizeRedisClusterPVC(client kubernetes.Interface, logger logr.Logger, cr *redisv1beta2.RedisCluster) error {
 	for _, role := range []string{"leader", "follower"} {
 		for i := 0; i < int(cr.Spec.GetReplicaCounts(role)); i++ {
-			PVCName := cr.Name + "-" + cr.Name + "-" + role + "-" + strconv.Itoa(i)
-			err := generateK8sClient().CoreV1().PersistentVolumeClaims(cr.Namespace).Delete(context.TODO(), PVCName, metav1.DeleteOptions{})
+			pvcTemplateName := env.GetString(EnvOperatorSTSPVCTemplateName, cr.Name+"-"+role)
+			PVCName := fmt.Sprintf("%s-%s-%s-%d", pvcTemplateName, cr.Name, role, i)
+			err := client.CoreV1().PersistentVolumeClaims(cr.Namespace).Delete(context.TODO(), PVCName, metav1.DeleteOptions{})
 			if err != nil && !errors.IsNotFound(err) {
 				logger.Error(err, "Could not delete Persistent Volume Claim "+PVCName)
 				return err
@@ -159,35 +157,32 @@ func finalizeRedisClusterPVC(cr *redisv1beta2.RedisCluster) error {
 		}
 		if cr.Spec.Storage.NodeConfVolume {
 			for i := 0; i < int(cr.Spec.GetReplicaCounts(role)); i++ {
-				PVCName := "node-conf" + cr.Name + "-" + role + "-" + strconv.Itoa(i)
-				err := generateK8sClient().CoreV1().PersistentVolumeClaims(cr.Namespace).Delete(context.TODO(), PVCName, metav1.DeleteOptions{})
+				PVCName := fmt.Sprintf("%s-%s-%s-%d", "node-conf", cr.Name, role, i)
+				err := client.CoreV1().PersistentVolumeClaims(cr.Namespace).Delete(context.TODO(), PVCName, metav1.DeleteOptions{})
 				if err != nil && !errors.IsNotFound(err) {
 					logger.Error(err, "Could not delete Persistent Volume Claim "+PVCName)
 					return err
 				}
 			}
 		}
-
 	}
 	return nil
 }
 
 // finalizeRedisReplicationPVC delete PVCs
-func finalizeRedisReplicationPVC(cr *redisv1beta2.RedisReplication) error {
-	logger := finalizerLogger(cr.Namespace, RedisReplicationFinalizer)
+func finalizeRedisReplicationPVC(client kubernetes.Interface, logger logr.Logger, cr *redisv1beta2.RedisReplication) error {
 	for i := 0; i < int(cr.Spec.GetReplicationCounts("replication")); i++ {
-		PVCName := cr.Name + "-" + cr.Name + "-" + strconv.Itoa(i)
-		err := generateK8sClient().CoreV1().PersistentVolumeClaims(cr.Namespace).Delete(context.TODO(), PVCName, metav1.DeleteOptions{})
+		pvcTemplateName := env.GetString(EnvOperatorSTSPVCTemplateName, cr.Name)
+		PVCName := fmt.Sprintf("%s-%s-%d", pvcTemplateName, cr.Name, i)
+		err := client.CoreV1().PersistentVolumeClaims(cr.Namespace).Delete(context.TODO(), PVCName, metav1.DeleteOptions{})
 		if err != nil && !errors.IsNotFound(err) {
 			logger.Error(err, "Could not delete Persistent Volume Claim "+PVCName)
 			return err
 		}
 	}
-
 	return nil
 }
 
 func finalizeRedisSentinelPVC(cr *redisv1beta2.RedisSentinel) error {
-
 	return nil
 }

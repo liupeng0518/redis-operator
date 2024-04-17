@@ -15,6 +15,7 @@ type KubernetesConfig struct {
 	ImagePullSecrets       *[]corev1.LocalObjectReference   `json:"imagePullSecrets,omitempty"`
 	UpdateStrategy         appsv1.StatefulSetUpdateStrategy `json:"updateStrategy,omitempty"`
 	Service                *ServiceConfig                   `json:"service,omitempty"`
+	IgnoreAnnotations      []string                         `json:"ignoreAnnotations,omitempty"`
 }
 
 // ServiceConfig define the type of service to be created and its annotations
@@ -35,7 +36,9 @@ type ExistingPasswordSecret struct {
 // RedisExporter interface will have the information for redis exporter related stuff
 // +k8s:deepcopy-gen=true
 type RedisExporter struct {
-	Enabled         bool                         `json:"enabled,omitempty"`
+	Enabled bool `json:"enabled,omitempty"`
+	// +kubebuilder:default:=9121
+	Port            *int                         `json:"port,omitempty"`
 	Image           string                       `json:"image"`
 	Resources       *corev1.ResourceRequirements `json:"resources,omitempty"`
 	ImagePullPolicy corev1.PullPolicy            `json:"imagePullPolicy,omitempty"`
@@ -51,6 +54,7 @@ type RedisConfig struct {
 // Storage is the inteface to add pvc and pv support in redis
 // +k8s:deepcopy-gen=true
 type Storage struct {
+	KeepAfterDelete     bool                         `json:"keepAfterDelete,omitempty"`
 	VolumeClaimTemplate corev1.PersistentVolumeClaim `json:"volumeClaimTemplate,omitempty"`
 	VolumeMount         AdditionalVolume             `json:"volumeMount,omitempty"`
 }
@@ -142,8 +146,9 @@ type RedisPodDisruptionBudget struct {
 
 // +k8s:deepcopy-gen=true
 type RedisSentinelConfig struct {
-	AdditionalSentinelConfig *string `json:"additionalSentinelConfig,omitempty"`
-	RedisReplicationName     string  `json:"redisReplicationName"`
+	AdditionalSentinelConfig *string              `json:"additionalSentinelConfig,omitempty"`
+	RedisReplicationName     string               `json:"redisReplicationName"`
+	RedisReplicationPassword *corev1.EnvVarSource `json:"redisReplicationPassword,omitempty"`
 	// +kubebuilder:default:=myMaster
 	MasterGroupName string `json:"masterGroupName,omitempty"`
 	// +kubebuilder:default:="6379"

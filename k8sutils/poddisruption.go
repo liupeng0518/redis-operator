@@ -12,23 +12,24 @@ import (
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/client-go/kubernetes"
 )
 
 // CreateRedisLeaderPodDisruptionBudget check and create a PodDisruptionBudget for Leaders
-func ReconcileRedisPodDisruptionBudget(cr *redisv1beta2.RedisCluster, role string, pdbParams *commonapi.RedisPodDisruptionBudget) error {
+func ReconcileRedisPodDisruptionBudget(cr *redisv1beta2.RedisCluster, role string, pdbParams *commonapi.RedisPodDisruptionBudget, cl kubernetes.Interface) error {
 	pdbName := cr.ObjectMeta.Name + "-" + role
 	logger := pdbLogger(cr.Namespace, pdbName)
 	if pdbParams != nil && pdbParams.Enabled {
-		labels := getRedisLabels(cr.ObjectMeta.Name, "cluster", role, cr.ObjectMeta.GetLabels())
-		annotations := generateStatefulSetsAnots(cr.ObjectMeta)
+		labels := getRedisLabels(cr.ObjectMeta.Name, cluster, role, cr.ObjectMeta.GetLabels())
+		annotations := generateStatefulSetsAnots(cr.ObjectMeta, cr.Spec.KubernetesConfig.IgnoreAnnotations)
 		pdbMeta := generateObjectMetaInformation(pdbName, cr.Namespace, labels, annotations)
 		pdbDef := generatePodDisruptionBudgetDef(cr, role, pdbMeta, cr.Spec.RedisLeader.PodDisruptionBudget)
-		return CreateOrUpdatePodDisruptionBudget(pdbDef)
+		return CreateOrUpdatePodDisruptionBudget(pdbDef, cl)
 	} else {
 		// Check if one exists, and delete it.
-		_, err := GetPodDisruptionBudget(cr.Namespace, pdbName)
+		_, err := GetPodDisruptionBudget(cr.Namespace, pdbName, cl)
 		if err == nil {
-			return deletePodDisruptionBudget(cr.Namespace, pdbName)
+			return deletePodDisruptionBudget(cr.Namespace, pdbName, cl)
 		} else if err != nil && errors.IsNotFound(err) {
 			logger.V(1).Info("Reconciliation Successful, no PodDisruptionBudget Found.")
 			// Its ok if its not found, as we're deleting anyway
@@ -38,20 +39,20 @@ func ReconcileRedisPodDisruptionBudget(cr *redisv1beta2.RedisCluster, role strin
 	}
 }
 
-func ReconcileSentinelPodDisruptionBudget(cr *redisv1beta2.RedisSentinel, pdbParams *commonapi.RedisPodDisruptionBudget) error {
+func ReconcileSentinelPodDisruptionBudget(cr *redisv1beta2.RedisSentinel, pdbParams *commonapi.RedisPodDisruptionBudget, cl kubernetes.Interface) error {
 	pdbName := cr.ObjectMeta.Name + "-sentinel"
 	logger := pdbLogger(cr.Namespace, pdbName)
 	if pdbParams != nil && pdbParams.Enabled {
-		labels := getRedisLabels(cr.ObjectMeta.Name, "sentinel", "sentinel", cr.ObjectMeta.GetLabels())
-		annotations := generateStatefulSetsAnots(cr.ObjectMeta)
+		labels := getRedisLabels(cr.ObjectMeta.Name, sentinel, "sentinel", cr.ObjectMeta.GetLabels())
+		annotations := generateStatefulSetsAnots(cr.ObjectMeta, cr.Spec.KubernetesConfig.IgnoreAnnotations)
 		pdbMeta := generateObjectMetaInformation(pdbName, cr.Namespace, labels, annotations)
 		pdbDef := generateSentinelPodDisruptionBudgetDef(cr, "sentinel", pdbMeta, pdbParams)
-		return CreateOrUpdatePodDisruptionBudget(pdbDef)
+		return CreateOrUpdatePodDisruptionBudget(pdbDef, cl)
 	} else {
 		// Check if one exists, and delete it.
-		_, err := GetPodDisruptionBudget(cr.Namespace, pdbName)
+		_, err := GetPodDisruptionBudget(cr.Namespace, pdbName, cl)
 		if err == nil {
-			return deletePodDisruptionBudget(cr.Namespace, pdbName)
+			return deletePodDisruptionBudget(cr.Namespace, pdbName, cl)
 		} else if err != nil && errors.IsNotFound(err) {
 			logger.V(1).Info("Reconciliation Successful, no PodDisruptionBudget Found.")
 			// Its ok if its not found, as we're deleting anyway
@@ -75,14 +76,14 @@ func generatePodDisruptionBudgetDef(cr *redisv1beta2.RedisCluster, role string, 
 		},
 	}
 	if pdbParams.MinAvailable != nil {
-		pdbTemplate.Spec.MinAvailable = &intstr.IntOrString{Type: intstr.Int, IntVal: int32(*pdbParams.MinAvailable)}
+		pdbTemplate.Spec.MinAvailable = &intstr.IntOrString{Type: intstr.Int, IntVal: (*pdbParams.MinAvailable)}
 	}
 	if pdbParams.MaxUnavailable != nil {
-		pdbTemplate.Spec.MaxUnavailable = &intstr.IntOrString{Type: intstr.Int, IntVal: int32(*pdbParams.MaxUnavailable)}
+		pdbTemplate.Spec.MaxUnavailable = &intstr.IntOrString{Type: intstr.Int, IntVal: *pdbParams.MaxUnavailable}
 	}
 	// If we don't have a value for either, assume quorum: (N/2)+1
 	if pdbTemplate.Spec.MaxUnavailable == nil && pdbTemplate.Spec.MinAvailable == nil {
-		pdbTemplate.Spec.MinAvailable = &intstr.IntOrString{Type: intstr.Int, IntVal: int32((*cr.Spec.Size / 2) + 1)}
+		pdbTemplate.Spec.MinAvailable = &intstr.IntOrString{Type: intstr.Int, IntVal: (*cr.Spec.Size / 2) + 1}
 	}
 	AddOwnerRefToObject(pdbTemplate, redisClusterAsOwner(cr))
 	return pdbTemplate
@@ -102,38 +103,38 @@ func generateSentinelPodDisruptionBudgetDef(cr *redisv1beta2.RedisSentinel, role
 		},
 	}
 	if pdbParams.MinAvailable != nil {
-		pdbTemplate.Spec.MinAvailable = &intstr.IntOrString{Type: intstr.Int, IntVal: int32(*pdbParams.MinAvailable)}
+		pdbTemplate.Spec.MinAvailable = &intstr.IntOrString{Type: intstr.Int, IntVal: *pdbParams.MinAvailable}
 	}
 	if pdbParams.MaxUnavailable != nil {
-		pdbTemplate.Spec.MaxUnavailable = &intstr.IntOrString{Type: intstr.Int, IntVal: int32(*pdbParams.MaxUnavailable)}
+		pdbTemplate.Spec.MaxUnavailable = &intstr.IntOrString{Type: intstr.Int, IntVal: *pdbParams.MaxUnavailable}
 	}
 	// If we don't have a value for either, assume quorum: (N/2)+1
 	if pdbTemplate.Spec.MaxUnavailable == nil && pdbTemplate.Spec.MinAvailable == nil {
-		pdbTemplate.Spec.MinAvailable = &intstr.IntOrString{Type: intstr.Int, IntVal: int32((*cr.Spec.Size / 2) + 1)}
+		pdbTemplate.Spec.MinAvailable = &intstr.IntOrString{Type: intstr.Int, IntVal: (*cr.Spec.Size / 2) + 1}
 	}
 	AddOwnerRefToObject(pdbTemplate, redisSentinelAsOwner(cr))
 	return pdbTemplate
 }
 
 // CreateOrUpdateService method will create or update Redis service
-func CreateOrUpdatePodDisruptionBudget(pdbDef *policyv1.PodDisruptionBudget) error {
+func CreateOrUpdatePodDisruptionBudget(pdbDef *policyv1.PodDisruptionBudget, cl kubernetes.Interface) error {
 	logger := pdbLogger(pdbDef.Namespace, pdbDef.Name)
-	storedPDB, err := GetPodDisruptionBudget(pdbDef.Namespace, pdbDef.Name)
+	storedPDB, err := GetPodDisruptionBudget(pdbDef.Namespace, pdbDef.Name, cl)
 	if err != nil {
-		if err := patch.DefaultAnnotator.SetLastAppliedAnnotation(pdbDef); err != nil {
+		if err := patch.DefaultAnnotator.SetLastAppliedAnnotation(pdbDef); err != nil { //nolint
 			logger.Error(err, "Unable to patch redis PodDisruptionBudget with comparison object")
 			return err
 		}
 		if errors.IsNotFound(err) {
-			return createPodDisruptionBudget(pdbDef.Namespace, pdbDef)
+			return createPodDisruptionBudget(pdbDef.Namespace, pdbDef, cl)
 		}
 		return err
 	}
-	return patchPodDisruptionBudget(storedPDB, pdbDef, pdbDef.Namespace)
+	return patchPodDisruptionBudget(storedPDB, pdbDef, pdbDef.Namespace, cl)
 }
 
 // patchPodDisruptionBudget will patch Redis Kubernetes PodDisruptionBudgets
-func patchPodDisruptionBudget(storedPdb *policyv1.PodDisruptionBudget, newPdb *policyv1.PodDisruptionBudget, namespace string) error {
+func patchPodDisruptionBudget(storedPdb *policyv1.PodDisruptionBudget, newPdb *policyv1.PodDisruptionBudget, namespace string, cl kubernetes.Interface) error {
 	logger := pdbLogger(namespace, storedPdb.Name)
 	// We want to try and keep this atomic as possible.
 	newPdb.ResourceVersion = storedPdb.ResourceVersion
@@ -169,15 +170,15 @@ func patchPodDisruptionBudget(storedPdb *policyv1.PodDisruptionBudget, newPdb *p
 			logger.Error(err, "Unable to patch redis PodDisruptionBudget with comparison object")
 			return err
 		}
-		return updatePodDisruptionBudget(namespace, newPdb)
+		return updatePodDisruptionBudget(namespace, newPdb, cl)
 	}
 	return nil
 }
 
 // createPodDisruptionBudget is a method to create PodDisruptionBudgets in Kubernetes
-func createPodDisruptionBudget(namespace string, pdb *policyv1.PodDisruptionBudget) error {
+func createPodDisruptionBudget(namespace string, pdb *policyv1.PodDisruptionBudget, cl kubernetes.Interface) error {
 	logger := pdbLogger(namespace, pdb.Name)
-	_, err := generateK8sClient().PolicyV1().PodDisruptionBudgets(namespace).Create(context.TODO(), pdb, metav1.CreateOptions{})
+	_, err := cl.PolicyV1().PodDisruptionBudgets(namespace).Create(context.TODO(), pdb, metav1.CreateOptions{})
 	if err != nil {
 		logger.Error(err, "Redis PodDisruptionBudget creation failed")
 		return err
@@ -187,9 +188,9 @@ func createPodDisruptionBudget(namespace string, pdb *policyv1.PodDisruptionBudg
 }
 
 // updatePodDisruptionBudget is a method to update PodDisruptionBudgets in Kubernetes
-func updatePodDisruptionBudget(namespace string, pdb *policyv1.PodDisruptionBudget) error {
+func updatePodDisruptionBudget(namespace string, pdb *policyv1.PodDisruptionBudget, cl kubernetes.Interface) error {
 	logger := pdbLogger(namespace, pdb.Name)
-	_, err := generateK8sClient().PolicyV1().PodDisruptionBudgets(namespace).Update(context.TODO(), pdb, metav1.UpdateOptions{})
+	_, err := cl.PolicyV1().PodDisruptionBudgets(namespace).Update(context.TODO(), pdb, metav1.UpdateOptions{})
 	if err != nil {
 		logger.Error(err, "Redis PodDisruptionBudget update failed")
 		return err
@@ -199,9 +200,9 @@ func updatePodDisruptionBudget(namespace string, pdb *policyv1.PodDisruptionBudg
 }
 
 // deletePodDisruptionBudget is a method to delete PodDisruptionBudgets in Kubernetes
-func deletePodDisruptionBudget(namespace string, pdbName string) error {
+func deletePodDisruptionBudget(namespace string, pdbName string, cl kubernetes.Interface) error {
 	logger := pdbLogger(namespace, pdbName)
-	err := generateK8sClient().PolicyV1().PodDisruptionBudgets(namespace).Delete(context.TODO(), pdbName, metav1.DeleteOptions{})
+	err := cl.PolicyV1().PodDisruptionBudgets(namespace).Delete(context.TODO(), pdbName, metav1.DeleteOptions{})
 	if err != nil {
 		logger.Error(err, "Redis PodDisruption deletion failed")
 		return err
@@ -211,14 +212,14 @@ func deletePodDisruptionBudget(namespace string, pdbName string) error {
 }
 
 // GetPodDisruptionBudget is a method to get PodDisruptionBudgets in Kubernetes
-func GetPodDisruptionBudget(namespace string, pdb string) (*policyv1.PodDisruptionBudget, error) {
+func GetPodDisruptionBudget(namespace string, pdb string, cl kubernetes.Interface) (*policyv1.PodDisruptionBudget, error) {
 	logger := pdbLogger(namespace, pdb)
 	getOpts := metav1.GetOptions{
 		TypeMeta: generateMetaInformation("PodDisruptionBudget", "policy/v1"),
 	}
-	pdbInfo, err := generateK8sClient().PolicyV1().PodDisruptionBudgets(namespace).Get(context.TODO(), pdb, getOpts)
+	pdbInfo, err := cl.PolicyV1().PodDisruptionBudgets(namespace).Get(context.TODO(), pdb, getOpts)
 	if err != nil {
-		logger.Info("Redis PodDisruptionBudget get action failed")
+		logger.V(1).Info("Redis PodDisruptionBudget get action failed")
 		return nil, err
 	}
 	logger.V(1).Info("Redis PodDisruptionBudget get action was successful")
