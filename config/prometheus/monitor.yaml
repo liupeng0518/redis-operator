@@ -4,13 +4,13 @@ apiVersion: monitoring.coreos.com/v1
 kind: ServiceMonitor
 metadata:
   labels:
-    control-plane: redis-operator
-  name: redis-operator-metrics-monitor
-  namespace: ot-operators
+    control-plane: controller-manager
+  name: controller-manager-metrics-monitor
+  namespace: system
 spec:
   endpoints:
     - path: /metrics
       port: https
   selector:
     matchLabels:
-      control-plane: redis-operator
+      control-plane: controller-manager

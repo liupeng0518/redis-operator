@@ -8,32 +8,38 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 )
 
-type K8sConfigProvider = func() (*rest.Config, error)
-
-// GenerateK8sClient create client for kubernetes
-func GenerateK8sClient(configProvider K8sConfigProvider) (kubernetes.Interface, error) {
-	config, err := configProvider()
+// generateK8sClient create client for kubernetes
+func generateK8sClient() *kubernetes.Clientset {
+	config, err := generateK8sConfig()
 	if err != nil {
-		return nil, err
+		panic(err.Error())
 	}
-	return kubernetes.NewForConfig(config)
+	clientset, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		panic(err.Error())
+	}
+	return clientset
 }
 
-// GenerateK8sClient create Dynamic client for kubernetes
-func GenerateK8sDynamicClient(configProvider K8sConfigProvider) (dynamic.Interface, error) {
-	config, err := configProvider()
+// generateK8sClient create Dynamic client for kubernetes
+func generateK8sDynamicClient() dynamic.Interface {
+	config, err := generateK8sConfig()
 	if err != nil {
-		return nil, err
+		panic(err.Error())
 	}
-	return dynamic.NewForConfig(config)
+	dynamicClientset, err := dynamic.NewForConfig(config)
+	if err != nil {
+		panic(err.Error())
+	}
+	return dynamicClientset
 }
 
-// GenerateK8sConfig will load the kube config file
-func GenerateK8sConfig() K8sConfigProvider {
+// generateK8sConfig will load the kube config file
+func generateK8sConfig() (*rest.Config, error) {
 	loadingRules := clientcmd.NewDefaultClientConfigLoadingRules()
 	// if you want to change the loading rules (which files in which order), you can do so here
 	configOverrides := &clientcmd.ConfigOverrides{}
 	// if you want to change override values or bind them to flags, there are methods to help you
 	kubeConfig := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(loadingRules, configOverrides)
-	return kubeConfig.ClientConfig
+	return kubeConfig.ClientConfig()
 }

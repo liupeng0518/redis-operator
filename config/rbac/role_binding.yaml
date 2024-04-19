@@ -5,7 +5,7 @@ metadata:
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
-  name: redis-operator-manager-role
+  name: redis-operator
 subjects:
 - kind: ServiceAccount
   name: redis-operator

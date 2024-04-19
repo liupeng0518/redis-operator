@@ -9,8 +9,6 @@ import (
 	"github.com/go-logr/logr"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/client-go/dynamic"
-	"k8s.io/client-go/kubernetes"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
@@ -18,10 +16,8 @@ import (
 // RedisSentinelReconciler reconciles a RedisSentinel object
 type RedisSentinelReconciler struct {
 	client.Client
-	K8sClient  kubernetes.Interface
-	Dk8sClient dynamic.Interface
-	Log        logr.Logger
-	Scheme     *runtime.Scheme
+	Log    logr.Logger
+	Scheme *runtime.Scheme
 }
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims
@@ -43,41 +39,36 @@ func (r *RedisSentinelReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{RequeueAfter: time.Second * 10}, nil
 	}
 
-	if instance.Spec.RedisSentinelConfig != nil && !k8sutils.IsRedisReplicationReady(ctx, reqLogger, r.K8sClient, r.Dk8sClient, instance) {
-		reqLogger.Info("Redis Replication is specified but not ready, so will reconcile again in 10 seconds")
-		return ctrl.Result{RequeueAfter: time.Second * 10}, nil
-	}
-
 	// Get total Sentinel Replicas
 	// sentinelReplicas := instance.Spec.GetSentinelCounts("sentinel")
 
-	if err = k8sutils.HandleRedisSentinelFinalizer(r.Client, r.Log, instance); err != nil {
+	if err := k8sutils.HandleRedisSentinelFinalizer(instance, r.Client); err != nil {
 		return ctrl.Result{RequeueAfter: time.Second * 60}, err
 	}
 
-	if err = k8sutils.AddRedisSentinelFinalizer(instance, r.Client); err != nil {
+	if err := k8sutils.AddRedisSentinelFinalizer(instance, r.Client); err != nil {
 		return ctrl.Result{RequeueAfter: time.Second * 60}, err
 	}
 
 	// Create Redis Sentinel
-	err = k8sutils.CreateRedisSentinel(ctx, r.K8sClient, r.Log, instance, r.K8sClient, r.Dk8sClient)
+	err = k8sutils.CreateRedisSentinel(instance)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
 
-	err = k8sutils.ReconcileSentinelPodDisruptionBudget(instance, instance.Spec.PodDisruptionBudget, r.K8sClient)
+	err = k8sutils.ReconcileSentinelPodDisruptionBudget(instance, instance.Spec.PodDisruptionBudget)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
 
 	// Create the Service for Redis Sentinel
-	err = k8sutils.CreateRedisSentinelService(instance, r.K8sClient)
+	err = k8sutils.CreateRedisSentinelService(instance)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
 
-	reqLogger.Info("Will reconcile after 600 seconds")
-	return ctrl.Result{RequeueAfter: time.Second * 600}, nil
+	reqLogger.Info("Will reconcile redis operator in again 10 seconds")
+	return ctrl.Result{RequeueAfter: time.Second * 10}, nil
 }
 
 // SetupWithManager sets up the controller with the Manager.

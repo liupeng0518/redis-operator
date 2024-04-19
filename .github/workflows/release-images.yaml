@@ -7,7 +7,7 @@ on:
 env:
   ApplicationName: redis-operator
   QuayImageName: liupeng0518/redis-operator
-  AppVersion: "v0.16.0"
+  AppVersion: "v0.15.1-2"
   DOCKERFILE_PATH: './Dockerfile'
 
 jobs:

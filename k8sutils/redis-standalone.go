@@ -1,43 +1,34 @@
 package k8sutils
 
-import (
-	redisv1beta2 "github.com/OT-CONTAINER-KIT/redis-operator/api/v1beta2"
-	"github.com/OT-CONTAINER-KIT/redis-operator/pkg/util"
-	"k8s.io/client-go/kubernetes"
-	"k8s.io/utils/pointer"
+import redisv1beta2 "github.com/OT-CONTAINER-KIT/redis-operator/api/v1beta2"
+
+var (
+	enableMetrics bool
 )
 
-//var (
-//	enableMetrics bool
-//)
-
 // CreateStandaloneService method will create standalone service for Redis
-func CreateStandaloneService(cr *redisv1beta2.Redis, cl kubernetes.Interface) error {
+func CreateStandaloneService(cr *redisv1beta2.Redis) error {
 	logger := serviceLogger(cr.Namespace, cr.ObjectMeta.Name)
-	labels := getRedisLabels(cr.ObjectMeta.Name, standalone, "standalone", cr.ObjectMeta.Labels)
-	var epp exporterPortProvider
-	if cr.Spec.RedisExporter != nil {
-		epp = func() (port int, enable bool) {
-			defaultP := pointer.Int(redisExporterPort)
-			return *util.Coalesce(cr.Spec.RedisExporter.Port, defaultP), cr.Spec.RedisExporter.Enabled
-		}
+	labels := getRedisLabels(cr.ObjectMeta.Name, "standalone", "standalone", cr.ObjectMeta.Labels)
+	annotations := generateServiceAnots(cr.ObjectMeta, nil)
+	if cr.Spec.RedisExporter != nil && cr.Spec.RedisExporter.Enabled {
+		enableMetrics = true
 	} else {
-		epp = disableMetrics
+		enableMetrics = false
 	}
-	annotations := generateServiceAnots(cr.ObjectMeta, nil, epp)
 	additionalServiceAnnotations := map[string]string{}
 	if cr.Spec.KubernetesConfig.Service != nil {
 		additionalServiceAnnotations = cr.Spec.KubernetesConfig.Service.ServiceAnnotations
 	}
 	objectMetaInfo := generateObjectMetaInformation(cr.ObjectMeta.Name, cr.Namespace, labels, annotations)
 	headlessObjectMetaInfo := generateObjectMetaInformation(cr.ObjectMeta.Name+"-headless", cr.Namespace, labels, annotations)
-	additionalObjectMetaInfo := generateObjectMetaInformation(cr.ObjectMeta.Name+"-additional", cr.Namespace, labels, generateServiceAnots(cr.ObjectMeta, additionalServiceAnnotations, epp))
-	err := CreateOrUpdateService(cr.Namespace, headlessObjectMetaInfo, redisAsOwner(cr), disableMetrics, true, "ClusterIP", redisPort, cl)
+	additionalObjectMetaInfo := generateObjectMetaInformation(cr.ObjectMeta.Name+"-additional", cr.Namespace, labels, generateServiceAnots(cr.ObjectMeta, additionalServiceAnnotations))
+	err := CreateOrUpdateService(cr.Namespace, headlessObjectMetaInfo, redisAsOwner(cr), false, true, "ClusterIP")
 	if err != nil {
 		logger.Error(err, "Cannot create standalone headless service for Redis")
 		return err
 	}
-	err = CreateOrUpdateService(cr.Namespace, objectMetaInfo, redisAsOwner(cr), epp, false, "ClusterIP", redisPort, cl)
+	err = CreateOrUpdateService(cr.Namespace, objectMetaInfo, redisAsOwner(cr), enableMetrics, false, "ClusterIP")
 	if err != nil {
 		logger.Error(err, "Cannot create standalone service for Redis")
 		return err
@@ -46,7 +37,7 @@ func CreateStandaloneService(cr *redisv1beta2.Redis, cl kubernetes.Interface) er
 	if cr.Spec.KubernetesConfig.Service != nil {
 		additionalServiceType = cr.Spec.KubernetesConfig.Service.ServiceType
 	}
-	err = CreateOrUpdateService(cr.Namespace, additionalObjectMetaInfo, redisAsOwner(cr), disableMetrics, false, additionalServiceType, redisPort, cl)
+	err = CreateOrUpdateService(cr.Namespace, additionalObjectMetaInfo, redisAsOwner(cr), false, false, additionalServiceType)
 	if err != nil {
 		logger.Error(err, "Cannot create additional service for Redis")
 		return err
@@ -55,10 +46,10 @@ func CreateStandaloneService(cr *redisv1beta2.Redis, cl kubernetes.Interface) er
 }
 
 // CreateStandaloneRedis will create a standalone redis setup
-func CreateStandaloneRedis(cr *redisv1beta2.Redis, cl kubernetes.Interface) error {
+func CreateStandaloneRedis(cr *redisv1beta2.Redis) error {
 	logger := statefulSetLogger(cr.Namespace, cr.ObjectMeta.Name)
-	labels := getRedisLabels(cr.ObjectMeta.Name, standalone, "standalone", cr.ObjectMeta.Labels)
-	annotations := generateStatefulSetsAnots(cr.ObjectMeta, cr.Spec.KubernetesConfig.IgnoreAnnotations)
+	labels := getRedisLabels(cr.ObjectMeta.Name, "standalone", "standalone", cr.ObjectMeta.Labels)
+	annotations := generateStatefulSetsAnots(cr.ObjectMeta)
 	objectMetaInfo := generateObjectMetaInformation(cr.ObjectMeta.Name, cr.Namespace, labels, annotations)
 	err := CreateOrUpdateStateFul(cr.Namespace,
 		objectMetaInfo,
@@ -67,7 +58,6 @@ func CreateStandaloneRedis(cr *redisv1beta2.Redis, cl kubernetes.Interface) erro
 		generateRedisStandaloneInitContainerParams(cr),
 		generateRedisStandaloneContainerParams(cr),
 		cr.Spec.Sidecars,
-		cl,
 	)
 	if err != nil {
 		logger.Error(err, "Cannot create standalone statefulset for Redis")
@@ -90,7 +80,6 @@ func generateRedisStandaloneParams(cr *redisv1beta2.Redis) statefulSetParameters
 		TerminationGracePeriodSeconds: cr.Spec.TerminationGracePeriodSeconds,
 		Tolerations:                   cr.Spec.Tolerations,
 		UpdateStrategy:                cr.Spec.KubernetesConfig.UpdateStrategy,
-		IgnoreAnnotations:             cr.Spec.KubernetesConfig.IgnoreAnnotations,
 	}
 	if cr.Spec.KubernetesConfig.ImagePullSecrets != nil {
 		res.ImagePullSecrets = cr.Spec.KubernetesConfig.ImagePullSecrets
@@ -103,6 +92,7 @@ func generateRedisStandaloneParams(cr *redisv1beta2.Redis) statefulSetParameters
 	}
 	if cr.Spec.RedisExporter != nil {
 		res.EnableMetrics = cr.Spec.RedisExporter.Enabled
+
 	}
 	if cr.Spec.ServiceAccountName != nil {
 		res.ServiceAccountName = cr.Spec.ServiceAccountName
@@ -123,7 +113,6 @@ func generateRedisStandaloneContainerParams(cr *redisv1beta2.Redis) containerPar
 		ImagePullPolicy: cr.Spec.KubernetesConfig.ImagePullPolicy,
 		Resources:       cr.Spec.KubernetesConfig.Resources,
 		SecurityContext: cr.Spec.SecurityContext,
-		Port:            pointer.Int(6379),
 	}
 
 	if cr.Spec.EnvVars != nil {
@@ -152,6 +141,7 @@ func generateRedisStandaloneContainerParams(cr *redisv1beta2.Redis) containerPar
 		if cr.Spec.RedisExporter.EnvVars != nil {
 			containerProp.RedisExporterEnv = cr.Spec.RedisExporter.EnvVars
 		}
+
 	}
 	if cr.Spec.ReadinessProbe != nil {
 		containerProp.ReadinessProbe = &cr.Spec.ReadinessProbe.Probe
@@ -197,6 +187,8 @@ func generateRedisStandaloneInitContainerParams(cr *redisv1beta2.Redis) initCont
 		if cr.Spec.Storage != nil {
 			initcontainerProp.PersistenceEnabled = &trueProperty
 		}
+
 	}
+
 	return initcontainerProp
 }

@@ -1,8 +1,8 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: redis-operator
-  namespace: ot-operators
+  name: controller-manager
+  namespace: system
 spec:
   template:
     spec:

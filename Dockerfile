@@ -1,5 +1,5 @@
 # Build the manager binary
-FROM golang:1.21 as builder
+FROM golang:1.17 as builder
 ARG BUILDOS
 ARG BUILDPLATFORM
 ARG BUILDARCH
@@ -22,8 +22,6 @@ COPY main.go main.go
 COPY api/ api/
 COPY controllers/ controllers/
 COPY k8sutils/ k8sutils/
-COPY pkg/ pkg/
-COPY mocks/ mocks/
 
 # Build
 ARG LDFLAGS="-s -w"

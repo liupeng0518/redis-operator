@@ -13,6 +13,8 @@ Ensure you have the following tools installed:
 
 ## **Steps**
 
+### **1. Set Up a 3-node Kind Cluster**
+
 ## Steps to Follow
 
 ### 1. Set Up a 3-node Kind Cluster
@@ -20,7 +22,7 @@ Ensure you have the following tools installed:
 Create a 3-node kind cluster using the provided configuration:
 
 ```bash
-kind create cluster --config tests/_config/kind-config.yaml
+kind create cluster --config /redis-operator/tests/_config/kind-example-config.yaml
 ```
 
 ### 2. Install the Redis Operator
@@ -35,14 +37,6 @@ Please refer to the repository's README for detailed instructions on installing 
 
 Execute the kuttl test using the following command:
 
-To run all default tests ( \_config/kuttl-test.yaml is the default config file )
-
 ```bash
-kubectl kuttl test --config tests/_config/kuttl-test.yaml
-```
-
-To run a test at specified path
-
-```bash
-kubectl kuttl test tests/e2e/v1beta2 --config tests/_config/kuttl-test.yaml --timeout 600
+kubectl kuttl test redis-operator/tests/e2e/v1beta2 --config /redis-operator/tests/_config/kuttl-test.yaml --timeout 10m
 ```

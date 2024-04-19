@@ -9,7 +9,6 @@ import (
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
-	"k8s.io/client-go/kubernetes"
 )
 
 const (
@@ -19,22 +18,20 @@ const (
 	redisExporterPortName = "redis-exporter"
 )
 
-var serviceType corev1.ServiceType
-
-// exporterPortProvider return the exporter port if bool is true
-type exporterPortProvider func() (port int, enable bool)
-
-var disableMetrics exporterPortProvider = func() (int, bool) {
-	return 0, false
-}
+var (
+	serviceType corev1.ServiceType
+)
 
 // generateServiceDef generates service definition for Redis
-func generateServiceDef(serviceMeta metav1.ObjectMeta, epp exporterPortProvider, ownerDef metav1.OwnerReference, headless bool, serviceType string, port int, extra ...corev1.ServicePort) *corev1.Service {
+func generateServiceDef(serviceMeta metav1.ObjectMeta, enableMetrics bool, ownerDef metav1.OwnerReference, headless bool, serviceType string) *corev1.Service {
 	var PortName string
+	var PortNum int32
 	if serviceMeta.Labels["role"] == "sentinel" {
 		PortName = "sentinel-client"
+		PortNum = sentinelPort
 	} else {
 		PortName = "redis-client"
+		PortNum = redisPort
 	}
 	service := &corev1.Service{
 		TypeMeta:   generateMetaInformation("Service", "v1"),
@@ -46,8 +43,8 @@ func generateServiceDef(serviceMeta metav1.ObjectMeta, epp exporterPortProvider,
 			Ports: []corev1.ServicePort{
 				{
 					Name:       PortName,
-					Port:       int32(port),
-					TargetPort: intstr.FromInt(port),
+					Port:       PortNum,
+					TargetPort: intstr.FromInt(int(PortNum)),
 					Protocol:   corev1.ProtocolTCP,
 				},
 			},
@@ -56,24 +53,20 @@ func generateServiceDef(serviceMeta metav1.ObjectMeta, epp exporterPortProvider,
 	if headless {
 		service.Spec.ClusterIP = "None"
 	}
-	if exporterPort, ok := epp(); ok {
-		redisExporterService := enableMetricsPort(exporterPort)
+	if enableMetrics {
+		redisExporterService := enableMetricsPort()
 		service.Spec.Ports = append(service.Spec.Ports, *redisExporterService)
 	}
-	if len(extra) > 0 {
-		service.Spec.Ports = append(service.Spec.Ports, extra...)
-	}
-
 	AddOwnerRefToObject(service, ownerDef)
 	return service
 }
 
 // enableMetricsPort will enable the metrics for Redis service
-func enableMetricsPort(port int) *corev1.ServicePort {
+func enableMetricsPort() *corev1.ServicePort {
 	return &corev1.ServicePort{
 		Name:       redisExporterPortName,
-		Port:       int32(port),
-		TargetPort: intstr.FromInt(port),
+		Port:       redisExporterPort,
+		TargetPort: intstr.FromInt(int(redisExporterPort)),
 		Protocol:   corev1.ProtocolTCP,
 	}
 }
@@ -94,8 +87,9 @@ func generateServiceType(k8sServiceType string) corev1.ServiceType {
 }
 
 // createService is a method to create service is Kubernetes
-func createService(kusClient kubernetes.Interface, logger logr.Logger, namespace string, service *corev1.Service) error {
-	_, err := kusClient.CoreV1().Services(namespace).Create(context.TODO(), service, metav1.CreateOptions{})
+func createService(namespace string, service *corev1.Service) error {
+	logger := serviceLogger(namespace, service.Name)
+	_, err := generateK8sClient().CoreV1().Services(namespace).Create(context.TODO(), service, metav1.CreateOptions{})
 	if err != nil {
 		logger.Error(err, "Redis service creation is failed")
 		return err
@@ -105,8 +99,9 @@ func createService(kusClient kubernetes.Interface, logger logr.Logger, namespace
 }
 
 // updateService is a method to update service is Kubernetes
-func updateService(k8sClient kubernetes.Interface, logger logr.Logger, namespace string, service *corev1.Service) error {
-	_, err := k8sClient.CoreV1().Services(namespace).Update(context.TODO(), service, metav1.UpdateOptions{})
+func updateService(namespace string, service *corev1.Service) error {
+	logger := serviceLogger(namespace, service.Name)
+	_, err := generateK8sClient().CoreV1().Services(namespace).Update(context.TODO(), service, metav1.UpdateOptions{})
 	if err != nil {
 		logger.Error(err, "Redis service update failed")
 		return err
@@ -116,13 +111,14 @@ func updateService(k8sClient kubernetes.Interface, logger logr.Logger, namespace
 }
 
 // getService is a method to get service is Kubernetes
-func getService(k8sClient kubernetes.Interface, logger logr.Logger, namespace string, name string) (*corev1.Service, error) {
+func getService(namespace string, service string) (*corev1.Service, error) {
+	logger := serviceLogger(namespace, service)
 	getOpts := metav1.GetOptions{
 		TypeMeta: generateMetaInformation("Service", "v1"),
 	}
-	serviceInfo, err := k8sClient.CoreV1().Services(namespace).Get(context.TODO(), name, getOpts)
+	serviceInfo, err := generateK8sClient().CoreV1().Services(namespace).Get(context.TODO(), service, getOpts)
 	if err != nil {
-		logger.V(1).Info("Redis service get action is failed")
+		logger.Info("Redis service get action is failed")
 		return nil, err
 	}
 	logger.V(1).Info("Redis service get action is successful")
@@ -135,24 +131,24 @@ func serviceLogger(namespace string, name string) logr.Logger {
 }
 
 // CreateOrUpdateService method will create or update Redis service
-func CreateOrUpdateService(namespace string, serviceMeta metav1.ObjectMeta, ownerDef metav1.OwnerReference, epp exporterPortProvider, headless bool, serviceType string, port int, cl kubernetes.Interface, extra ...corev1.ServicePort) error {
+func CreateOrUpdateService(namespace string, serviceMeta metav1.ObjectMeta, ownerDef metav1.OwnerReference, enableMetrics, headless bool, serviceType string) error {
 	logger := serviceLogger(namespace, serviceMeta.Name)
-	serviceDef := generateServiceDef(serviceMeta, epp, ownerDef, headless, serviceType, port, extra...)
-	storedService, err := getService(cl, logger, namespace, serviceMeta.GetName())
+	serviceDef := generateServiceDef(serviceMeta, enableMetrics, ownerDef, headless, serviceType)
+	storedService, err := getService(namespace, serviceMeta.Name)
 	if err != nil {
 		if errors.IsNotFound(err) {
-			if err := patch.DefaultAnnotator.SetLastAppliedAnnotation(serviceDef); err != nil { //nolint
+			if err := patch.DefaultAnnotator.SetLastAppliedAnnotation(serviceDef); err != nil {
 				logger.Error(err, "Unable to patch redis service with compare annotations")
 			}
-			return createService(cl, logger, namespace, serviceDef)
+			return createService(namespace, serviceDef)
 		}
 		return err
 	}
-	return patchService(storedService, serviceDef, namespace, cl)
+	return patchService(storedService, serviceDef, namespace)
 }
 
 // patchService will patch Redis Kubernetes service
-func patchService(storedService *corev1.Service, newService *corev1.Service, namespace string, cl kubernetes.Interface) error {
+func patchService(storedService *corev1.Service, newService *corev1.Service, namespace string) error {
 	logger := serviceLogger(namespace, storedService.Name)
 	// We want to try and keep this atomic as possible.
 	newService.ResourceVersion = storedService.ResourceVersion
@@ -185,7 +181,7 @@ func patchService(storedService *corev1.Service, newService *corev1.Service, nam
 			return err
 		}
 		logger.V(1).Info("Syncing Redis service with defined properties")
-		return updateService(cl, logger, namespace, newService)
+		return updateService(namespace, newService)
 	}
 	logger.V(1).Info("Redis service is already in-sync")
 	return nil
