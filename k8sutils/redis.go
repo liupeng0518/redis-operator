@@ -621,14 +621,39 @@ func CreateMasterSlaveReplication(cr *redisv1beta2.RedisReplication, masterPods 
 	return nil
 }
 
+// checkAttachedSlave would return redis pod name which has slave
+func checkAttachedSlaves(ctx context.Context, redisClient *redis.Client, logger logr.Logger, podName string) int {
+	info, err := redisClient.Info("Replication").Result()
+	if err != nil {
+		logger.Error(err, "Failed to get the connected slaves count of the", "redis pod", podName)
+		return -1 // return -1 if failed to get the connected slaves count
+	}
+
+	lines := strings.Split(info, "\r\n")
+	for _, line := range lines {
+		if strings.HasPrefix(line, "connected_slaves:") {
+			var connected_slaves int
+			connected_slaves, err = strconv.Atoi(strings.TrimPrefix(line, "connected_slaves:"))
+			if err != nil {
+				logger.Error(err, "Failed to convert the connected slaves count of the", "redis pod", podName)
+				return -1
+			}
+			logger.V(1).Info("Connected Slaves of the Redis Pod", "pod", podName, "connected_slaves", connected_slaves)
+			return connected_slaves
+		}
+	}
+
+	logger.Error(nil, "Failed to find connected_slaves from Info # Replication in", "redis pod", podName)
+	return 0
+}
+
 func GetRedisReplicationRealMaster(ctx context.Context, client kubernetes.Interface, logger logr.Logger, cr *redisv1beta2.RedisReplication, masterPods []string) string {
 	for _, podName := range masterPods {
 		redisClient := configureRedisReplicationClient(cr, podName)
 		defer redisClient.Close()
 
-		realMasterPod := checkAttachedSlave(cr, masterPods)
-		if realMasterPod != "" {
-			return realMasterPod
+		if checkAttachedSlaves(ctx, redisClient, logger, podName) > 0 {
+			return podName
 		}
 	}
 	return ""
