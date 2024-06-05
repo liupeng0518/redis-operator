@@ -2,6 +2,8 @@ package controllers
 
 import (
 	"context"
+	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/kubernetes"
 	"strconv"
 	"time"
 
@@ -17,8 +19,10 @@ import (
 // RedisReplicationReconciler reconciles a RedisReplication object
 type RedisReplicationReconciler struct {
 	client.Client
-	Log    logr.Logger
-	Scheme *runtime.Scheme
+	Log        logr.Logger
+	K8sClient  kubernetes.Interface
+	Dk8sClient dynamic.Interface
+	Scheme     *runtime.Scheme
 }
 
 func (r *RedisReplicationReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -76,16 +80,60 @@ func (r *RedisReplicationReconciler) Reconcile(ctx context.Context, req ctrl.Req
 
 	reqLogger.Info("Creating redis replication by executing replication creation commands", "Replication.Ready", strconv.Itoa(int(redisReplicationInfo.Status.ReadyReplicas)))
 
-	//if len(k8sutils.GetRedisNodesByRole(instance, "master")) > int(leaderReplicas) {
-	if 2 > int(leaderReplicas) {
-
+	// Check that the Leader and Follower are ready in redis replication
+	if redisReplicationInfo.Status.ReadyReplicas != totalReplicas {
+		var realMaster string
 		masterNodes := k8sutils.GetRedisNodesByRole(instance, "master")
 		slaveNodes := k8sutils.GetRedisNodesByRole(instance, "slave")
-		err := k8sutils.CreateMasterSlaveReplication(instance, masterNodes, slaveNodes)
-		if err != nil {
-			return ctrl.Result{RequeueAfter: time.Second * 60}, err
+
+		if redisReplicationInfo.Status.ReadyReplicas == 0 {
+			reqLogger.Info("Redis replication nodes are not ready yet", "Ready.Replicas", strconv.Itoa(int(redisReplicationInfo.Status.ReadyReplicas)), "Expected.Replicas", totalReplicas)
+			return ctrl.Result{RequeueAfter: time.Second * 60}, nil
 		}
 
+		reqLogger.Info("The number of Redis replication replicas is less than the desired status\n", "Ready.Replicas", strconv.Itoa(int(redisReplicationInfo.Status.ReadyReplicas)), "Expected.Replicas", totalReplicas)
+		if len(masterNodes) == int(leaderReplicas) && followerReplicas != 0 && len(slaveNodes) != 0 {
+			realMaster = k8sutils.GetRedisReplicationRealMaster(ctx, r.K8sClient, r.Log, instance, masterNodes)
+			if err = k8sutils.UpdateRoleLabelPod(ctx, r.K8sClient, r.Log, instance, "master", []string{realMaster}); err != nil {
+				return ctrl.Result{Requeue: true}, err
+			}
+			if err = k8sutils.UpdateRoleLabelPod(ctx, r.K8sClient, r.Log, instance, "slave", slaveNodes); err != nil {
+				return ctrl.Result{RequeueAfter: time.Second * 1}, err
+			}
+		}
+		return ctrl.Result{RequeueAfter: time.Second * 1}, nil
+	}
+
+	var realMaster string
+	masterNodes := k8sutils.GetRedisNodesByRole(instance, "master")
+	if len(masterNodes) > int(leaderReplicas) {
+		reqLogger.Info("Creating redis replication by executing replication creation commands", "Replication.Ready", strconv.Itoa(int(redisReplicationInfo.Status.ReadyReplicas)))
+		slaveNodes := k8sutils.GetRedisNodesByRole(instance, "slave")
+		realMaster = k8sutils.GetRedisReplicationRealMaster(ctx, r.K8sClient, r.Log, instance, masterNodes)
+
+		if len(slaveNodes) == 0 {
+			realMaster = masterNodes[0]
+		}
+		if err = k8sutils.UpdateRoleLabelPod(ctx, r.K8sClient, r.Log, instance, "master", []string{realMaster}); err != nil {
+			return ctrl.Result{Requeue: true}, err
+		}
+		err = k8sutils.CreateMasterSlaveReplication(instance, masterNodes, slaveNodes)
+		if err != nil {
+			return ctrl.Result{Requeue: true}, err
+		}
+		if err = k8sutils.UpdateRoleLabelPod(ctx, r.K8sClient, r.Log, instance, "slave", slaveNodes); err != nil {
+			return ctrl.Result{Requeue: true}, err
+		}
+	}
+
+	realMaster = k8sutils.GetRedisReplicationRealMaster(ctx, r.K8sClient, r.Log, instance, masterNodes)
+	slaveNodes := k8sutils.GetRedisNodesByRole(instance, "slave")
+
+	if err = k8sutils.UpdateRoleLabelPod(ctx, r.K8sClient, r.Log, instance, "master", []string{realMaster}); err != nil {
+		return ctrl.Result{}, err
+	}
+	if err = k8sutils.UpdateRoleLabelPod(ctx, r.K8sClient, r.Log, instance, "slave", slaveNodes); err != nil {
+		return ctrl.Result{}, err
 	}
 
 	reqLogger.Info("Will reconcile redis operator in again 10 seconds")
