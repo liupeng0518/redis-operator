@@ -18,6 +18,7 @@ package main
 
 import (
 	"flag"
+	"github.com/OT-CONTAINER-KIT/redis-operator/k8sutils"
 	"os"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
@@ -90,6 +91,17 @@ func main() {
 		setupLog.Error(err, "unable to start manager")
 		os.Exit(1)
 	}
+	k8sclient, err := k8sutils.GenerateK8sClient(k8sutils.GenerateK8sConfig())
+	if err != nil {
+		setupLog.Error(err, "unable to create k8s client")
+		os.Exit(1)
+	}
+
+	dk8sClient, err := k8sutils.GenerateK8sDynamicClient(k8sutils.GenerateK8sConfig())
+	if err != nil {
+		setupLog.Error(err, "unable to create k8s dynamic client")
+		os.Exit(1)
+	}
 
 	if err = (&controllers.RedisReconciler{
 		Client: mgr.GetClient(),
@@ -108,9 +120,11 @@ func main() {
 		os.Exit(1)
 	}
 	if err = (&controllers.RedisReplicationReconciler{
-		Client: mgr.GetClient(),
-		Log:    ctrl.Log.WithName("controllers").WithName("RedisReplication"),
-		Scheme: mgr.GetScheme(),
+		Client:     mgr.GetClient(),
+		K8sClient:  k8sclient,
+		Dk8sClient: dk8sClient,
+		Log:        ctrl.Log.WithName("controllers").WithName("RedisReplication"),
+		Scheme:     mgr.GetScheme(),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "RedisReplication")
 		os.Exit(1)
