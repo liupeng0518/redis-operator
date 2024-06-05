@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/csv"
 	"fmt"
+	"k8s.io/client-go/kubernetes"
 	"net"
 	"strconv"
 	"strings"
@@ -618,4 +619,17 @@ func CreateMasterSlaveReplication(cr *redisv1beta2.RedisReplication, masterPods 
 	}
 
 	return nil
+}
+
+func GetRedisReplicationRealMaster(ctx context.Context, client kubernetes.Interface, logger logr.Logger, cr *redisv1beta2.RedisReplication, masterPods []string) string {
+	for _, podName := range masterPods {
+		redisClient := configureRedisReplicationClient(cr, podName)
+		defer redisClient.Close()
+
+		realMasterPod := checkAttachedSlave(cr, masterPods)
+		if realMasterPod != "" {
+			return realMasterPod
+		}
+	}
+	return ""
 }
