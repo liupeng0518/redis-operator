@@ -34,13 +34,10 @@ func generateServiceDef(serviceMeta metav1.ObjectMeta, enableMetrics bool, owner
 		PortNum = redisPort
 	}
 	selectorLabels := serviceMeta.GetLabels()
-	if serviceMeta.GetName() == "redis-replication-leader" {
+	if serviceMeta.GetName() == ownerDef.Name+"-leader" {
 		selectorLabels["redis-role"] = "master"
 	}
-	if serviceMeta.GetName() == "redis-replication-follower" {
-		selectorLabels["redis-role"] = "slave"
-	}
-	if serviceMeta.GetName() == "redis-replication-follower" {
+	if serviceMeta.GetName() == ownerDef.Name+"-follower" {
 		selectorLabels["redis-role"] = "slave"
 	}
 	service := &corev1.Service{
