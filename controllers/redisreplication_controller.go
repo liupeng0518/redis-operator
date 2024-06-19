@@ -2,10 +2,11 @@ package controllers
 
 import (
 	"context"
-	"k8s.io/client-go/dynamic"
-	"k8s.io/client-go/kubernetes"
 	"strconv"
 	"time"
+
+	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/kubernetes"
 
 	redisv1beta2 "github.com/OT-CONTAINER-KIT/redis-operator/api/v1beta2"
 	"github.com/OT-CONTAINER-KIT/redis-operator/k8sutils"
@@ -129,6 +130,13 @@ func (r *RedisReplicationReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	realMaster = k8sutils.GetRedisReplicationRealMaster(ctx, r.K8sClient, r.Log, instance, masterNodes)
 	slaveNodes := k8sutils.GetRedisNodesByRole(instance, "slave")
 
+	reqLogger.Info("The redis pod number is \n", "Replication.Size", totalReplicas)
+	if totalReplicas == 1 {
+		reqLogger.Info("The redis master pods \n", "Replication.masterNodes", masterNodes)
+		if err = k8sutils.UpdateRoleLabelPod(ctx, r.K8sClient, r.Log, instance, "master", masterNodes); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
 	if err = k8sutils.UpdateRoleLabelPod(ctx, r.K8sClient, r.Log, instance, "master", []string{realMaster}); err != nil {
 		return ctrl.Result{}, err
 	}
